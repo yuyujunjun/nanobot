@@ -20,7 +20,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
-
+from nanobot.agent.agent_utils import AgentLoopCommon
 
 class AgentLoop:
     """
@@ -60,7 +60,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         
         self.context = ContextBuilder(workspace)
-        self.sessions = session_manager or SessionManager(workspace)
+        self.sessions = session_manager or SessionManager(workspace,[model])
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -74,6 +74,24 @@ class AgentLoop:
         
         self._running = False
         self._register_default_tools()
+    
+    def _get_session_config_value(self, session: "Session", key: str, default: Any) -> Any:
+        """
+        Get a config value from session, fallback to agent default.
+        
+        This helper keeps config resolution logic in one place,
+        making it easy to move to a middleware layer later.
+        
+        Args:
+            session: The session object
+            key: Config key (e.g., 'model', 'max_iterations')
+            default: Agent-level default value
+        
+        Returns:
+            The effective config value
+        """
+        session_value = getattr(session.config, key, None)
+        return session_value if session_value is not None else default
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -116,7 +134,7 @@ class AgentLoop:
             try:
                 # Wait for next message
                 msg = await asyncio.wait_for(
-                    self.bus.consume_inbound(),
+                    self.bus.consume_agent(),
                     timeout=1.0
                 )
                 
@@ -156,11 +174,14 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
         
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+        # Agent 处理消息
+        user_key = f"{msg.channel}:{msg.chat_id}"
+        session = self.sessions.get_or_create(user_key)
         
-        # Get or create session
-        session = self.sessions.get_or_create(msg.session_key)
+        # 恢复 IOSystem 附加的权限信息
+        if 'session_permissions' in msg.metadata:
+            session.granted_permissions = msg.metadata['session_permissions']
+        
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -184,51 +205,17 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
         
-        # Agent loop
-        iteration = 0
-        final_content = None
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            # Call LLM
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
-            
-            # Handle tool calls
-            if response.has_tool_calls:
-                # Add assistant message with tool calls
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-                
-                # Execute tools
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-            else:
-                # No tool calls, we're done
-                final_content = response.content
-                break
+        # Agent loop using common function with IOManager
+        final_content, messages = await AgentLoopCommon(
+            provider=self.provider,
+            messages=messages,
+            tools=self.tools,
+            session=session,
+            context_builder=self.context,
+            bus=self.bus,
+            origin_channel=msg.channel,
+            origin_chat_id=msg.chat_id,
+        )
         
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -245,8 +232,36 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            content=final_content
+        )
+    
+    
+    async def _process_command(self, msg: InboundMessage) -> OutboundMessage:
+        """
+        Process a meta command (e.g., /model, /session).
+        
+        Delegates to CommandHandler which interacts with SessionManager.
+        
+        Args:
+            msg: The inbound message containing the command.
+        
+        Returns:
+            Response message with command result.
+        """
+        content = msg.content.strip()
+        
+        # Parse command
+        parts = content[1:].split(maxsplit=1)
+        command = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        
+        # Process command via handler (CommandHandler will handle session operations)
+        response = await self.command_handler.process(command, args, msg.session_key)
+        
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=response
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -293,46 +308,17 @@ class AgentLoop:
             chat_id=origin_chat_id,
         )
         
-        # Agent loop (limited for announce handling)
-        iteration = 0
-        final_content = None
-        
-        while iteration < self.max_iterations:
-            iteration += 1
-            
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model
-            )
-            
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-                
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-            else:
-                final_content = response.content
-                break
+        # Agent loop using common function
+        final_content, messages = await AgentLoopCommon(
+            provider=self.provider,
+            messages=messages,
+            tools=self.tools,
+            session=session,
+            context_builder=self.context,
+            bus=self.bus,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+        )
         
         if final_content is None:
             final_content = "Background task completed."

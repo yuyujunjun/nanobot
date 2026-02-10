@@ -10,6 +10,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.tui import TUIChannel
 from nanobot.config.schema import Config
 
 if TYPE_CHECKING:
@@ -141,6 +142,16 @@ class ChannelManager:
                 logger.info("QQ channel enabled")
             except ImportError as e:
                 logger.warning(f"QQ channel not available: {e}")
+        try:
+            from nanobot.channels.tui import TUIChannel
+            self.channels["tui"] = TUIChannel(
+                self.config.channels.tui,
+                self.bus,
+            )
+            logger.info("TUI channel enabled")
+        except ImportError as e:
+            logger.warning(f"TUI channel not available: {e}")
+        
     
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""

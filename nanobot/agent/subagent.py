@@ -15,6 +15,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.agent.agent_utils import AgentLoopCommon
 
 
 class SubagentManager:
@@ -52,6 +53,7 @@ class SubagentManager:
         label: str | None = None,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        session = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -75,7 +77,7 @@ class SubagentManager:
         
         # Create background task
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin,session=session)
         )
         self._running_tasks[task_id] = bg_task
         
@@ -91,6 +93,7 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        session,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
@@ -117,53 +120,18 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
             
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
-            
-            while iteration < max_iterations:
-                iteration += 1
-                
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                )
-                
-                if response.has_tool_calls:
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
-                    })
-                    
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments)
-                        logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                else:
-                    final_result = response.content
-                    break
+            # Run agent loop using common function
+            final_result, messages = await AgentLoopCommon(
+                provider=self.provider,
+                messages=messages,
+                tools=tools,
+                session=session,
+                context_builder=None,
+                task_id=task_id,
+                bus=self.bus,
+                origin_channel=origin['channel'],
+                origin_chat_id=origin['chat_id'],
+            )
             
             if final_result is None:
                 final_result = "Task completed but no final response was generated."
@@ -205,8 +173,8 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             content=announce_content,
         )
         
-        await self.bus.publish_inbound(msg)
-        logger.debug(f"Subagent [{task_id}] announced result to {origin['channel']}:{origin['chat_id']}")
+        await self.bus.publish_agent(msg)
+        logger.debug(f"Subagent [{task_id}] announced result to {origin['channel']}:{origin['chat_id']}, result: {result[:50]}")
     
     def _build_subagent_prompt(self, task: str) -> str:
         """Build a focused system prompt for the subagent."""

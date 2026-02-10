@@ -1,7 +1,7 @@
 """Base channel interface for chat platforms."""
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 

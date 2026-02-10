@@ -16,7 +16,7 @@ from rich.table import Table
 from rich.text import Text
 
 from nanobot import __version__, __logo__
-
+from nanobot.io.io_system import IOSystem
 app = typer.Typer(
     name="nanobot",
     help=f"{__logo__} nanobot - Personal AI Assistant",
@@ -346,7 +346,7 @@ def gateway(
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
+    session_manager = SessionManager(config.workspace_path,[config.agents.defaults.model])
     
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -400,6 +400,7 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus, session_manager=session_manager)
     
+    io_system = IOSystem(session_manager,bus)
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -416,6 +417,7 @@ def gateway(
             await cron.start()
             await heartbeat.start()
             await asyncio.gather(
+                io_system.start(),
                 agent.run(),
                 channels.start_all(),
             )
@@ -429,6 +431,32 @@ def gateway(
     asyncio.run(run())
 
 
+# ============================================================================
+# TUI Command
+# ============================================================================
+
+
+@app.command()
+def tui(
+    api_url: str = typer.Option("http://localhost:18790", "--api", help="Gateway HTTP API URL"),
+):
+    """Start TUI mode for interactive input (connects to gateway API)."""
+    from nanobot.channels.tui import TUIInput
+    
+    tui_input = TUIInput(gateway_url=api_url)
+    
+    async def run():
+        try:
+            await tui_input.start()
+        except KeyboardInterrupt:
+            pass
+    
+    asyncio.run(run())
+
+
+# ============================================================================
+# TUI Command
+# ============================================================================
 
 
 # ============================================================================

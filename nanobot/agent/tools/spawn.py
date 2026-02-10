@@ -62,4 +62,5 @@ class SpawnTool(Tool):
             label=label,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
+            session = kwargs.get("session"),
         )

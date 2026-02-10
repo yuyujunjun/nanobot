@@ -4,7 +4,9 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-
+class TUIAppConfig(BaseModel):
+    """TUI channel configuration."""
+    port: int = 18790
 class WhatsAppConfig(BaseModel):
     """WhatsApp channel configuration."""
     enabled: bool = False
@@ -152,6 +154,7 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    tui: TUIAppConfig = Field(default_factory=TUIAppConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -226,7 +229,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+    models: list[str] = Field(default_factory=list)  # Optional list of allowed models (overrides provider matching)
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""

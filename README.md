@@ -19,7 +19,7 @@
 📏 Real-time line count: **3,510 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
 ## 📢 News
-
+- **2026-02-10** Add permission management and session management, improve use command interaction, see [details](https://github.com/HKUDS/nanobot/docs/updates/update.md)
 - **2026-02-10** 🎉 Released v0.1.3.post6 with improvements! Check the updates [notes](https://github.com/HKUDS/nanobot/releases/tag/v0.1.3.post6) and our [roadmap](https://github.com/HKUDS/nanobot/discussions/431).
 - **2026-02-09** 💬 Added Slack, Email, and QQ support — nanobot now supports multiple chat platforms!
 - **2026-02-08** 🔧 Refactored Providers—adding a new LLM provider now takes just 2 simple steps! Check [here](#providers).

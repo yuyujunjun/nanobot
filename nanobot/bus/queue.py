@@ -19,19 +19,25 @@ class MessageBus:
     def __init__(self):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+        self.agentbound : asyncio.Queue[InboundMessage] = asyncio.Queue()
         self._outbound_subscribers: dict[str, list[Callable[[OutboundMessage], Awaitable[None]]]] = {}
         self._running = False
     
     async def publish_inbound(self, msg: InboundMessage) -> None:
-        """Publish a message from a channel to the agent."""
+        """Publish a message from to the IO system."""
         await self.inbound.put(msg)
-    
+    async def publish_agent(self,msg:InboundMessage) -> None:
+        """Publish a message to agent."""
+        await self.agentbound.put(msg)
+    async def consume_agent(self) -> InboundMessage:
+        """Consume the next message from the agent (blocks until available)."""
+        return await self.agentbound.get()
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
         return await self.inbound.get()
     
     async def publish_outbound(self, msg: OutboundMessage) -> None:
-        """Publish a response from the agent to channels."""
+        """Publish a response to channels."""
         await self.outbound.put(msg)
     
     async def consume_outbound(self) -> OutboundMessage:
