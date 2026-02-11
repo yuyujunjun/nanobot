@@ -30,11 +30,15 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     if schedule.kind == "cron" and schedule.expr:
         try:
             from croniter import croniter
-            cron = croniter(schedule.expr, time.time())
-            next_time = cron.get_next()
-            return int(next_time * 1000)
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+            tz = ZoneInfo(schedule.tz) if schedule.tz else ZoneInfo("UTC")
+            base = datetime.now(tz)
+            cron = croniter(schedule.expr, base)
+            next_time = cron.get_next(datetime)
+            return int(next_time.timestamp() * 1000)
         except Exception:
-            return None
+            return logger.warning(f"cannot execute cron job with invalid expression: {schedule.expr}")
     
     return None
 
