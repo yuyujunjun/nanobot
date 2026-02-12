@@ -172,7 +172,7 @@ async def AgentLoopCommon(
     
     while iteration < max_iterations:
         iteration += 1
-        preview = messages[-1]["content"][:80] + "..." if len(messages[-1]["content"]) > 80 else messages[-1]["content"]
+        preview = messages[-1]["content"][:40] + "..." if len(messages[-1]["content"]) > 40 else messages[-1]["content"]
         logger.info(f"Processing message from {origin_channel}:{origin_chat_id}: {preview}")
         
         # Call LLM with session-specific model
@@ -208,7 +208,7 @@ async def AgentLoopCommon(
                     "content": response.content or "",
                     "tool_calls": tool_call_dicts,
                 })
-            
+            logger.info(response.reasoning_content)
             # Execute tools
             for tool_call in response.tool_calls:
                 args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -217,7 +217,7 @@ async def AgentLoopCommon(
                 if task_id:
                     logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
                 else:
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:50]})")
                 
                 result = await tools.execute(tool_call.name, tool_call.arguments, session=session)
                 
@@ -281,8 +281,12 @@ async def AgentLoopCommon(
                         "content": result,
                     })
         else:
+            # logger.info(f"No tool call, the response is {origin_channel}:{origin_chat_id}: { response.content[:40] + '...' if response.content and len(response.content) > 40 else response.content}")
             # No tool calls, we're done
-            final_content = response.content
+            if response.content == "":
+                final_content = "reasoning content: " + response.reasoning_content
+            else:
+                final_content = response.content
             break
     
     return final_content, messages
