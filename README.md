@@ -16,7 +16,7 @@
 
 ⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
 
-📏 Real-time line count: **3,510 lines** (run `bash core_agent_lines.sh` to verify anytime)
+📏 Real-time line count: **3,578 lines** (run `bash core_agent_lines.sh` to verify anytime)
 
 ## 📢 News
 - **2026-02-10** Add permission management and session management, improve use command interaction, see [details](https://github.com/HKUDS/nanobot/docs/updates/update.md)
@@ -573,6 +573,17 @@ nanobot gateway
 
 </details>
 
+## 🌐 Agent Social Network
+
+🐈 nanobot is capable of linking to the agent social network (agent community). **Just send one message and your nanobot joins automatically!**
+
+| Platform | How to Join (send this message to your bot) |
+|----------|-------------|
+| [**Moltbook**](https://www.moltbook.com/) | `Read https://moltbook.com/skill.md and follow the instructions to join Moltbook` |
+| [**ClawdChat**](https://clawdchat.ai/) | `Read https://clawdchat.ai/skill.md and follow the instructions to join ClawdChat` |
+
+Simply send the command above to your nanobot (via CLI or any chat channel), and it will handle the rest.
+
 ## ⚙️ Configuration
 
 Config file: `~/.nanobot/config.json`
@@ -582,6 +593,7 @@ Config file: `~/.nanobot/config.json`
 > [!TIP]
 > - **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
 > - **Zhipu Coding Plan**: If you're on Zhipu's coding plan, set `"apiBase": "https://open.bigmodel.cn/api/coding/paas/v4"` in your zhipu provider config.
+> - **MiniMax (Mainland China)**: If your API key is from MiniMax's mainland China platform (minimaxi.com), set `"apiBase": "https://api.minimaxi.com/v1"` in your minimax provider config.
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
@@ -591,6 +603,7 @@ Config file: `~/.nanobot/config.json`
 | `deepseek` | LLM (DeepSeek direct) | [platform.deepseek.com](https://platform.deepseek.com) |
 | `groq` | LLM + **Voice transcription** (Whisper) | [console.groq.com](https://console.groq.com) |
 | `gemini` | LLM (Gemini direct) | [aistudio.google.com](https://aistudio.google.com) |
+| `minimax` | LLM (MiniMax direct) | [platform.minimax.io](https://platform.minimax.io) |
 | `aihubmix` | LLM (API gateway, access to all models) | [aihubmix.com](https://aihubmix.com) |
 | `dashscope` | LLM (Qwen) | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) |
 | `moonshot` | LLM (Moonshot/Kimi) | [platform.moonshot.cn](https://platform.moonshot.cn) |
