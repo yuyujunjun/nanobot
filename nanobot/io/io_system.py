@@ -144,6 +144,8 @@ class IOSystem:
         """
         user_key = f"{msg.channel}:{msg.chat_id}"
         session = self.sessions.get_or_create(user_key)
+                
+        # Handle slash commands
         
         # 1. Check if it's a system command
         if msg.content.strip().startswith('/'):

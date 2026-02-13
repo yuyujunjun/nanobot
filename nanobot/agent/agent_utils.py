@@ -169,7 +169,7 @@ async def AgentLoopCommon(
     
     iteration = 0
     final_content = None
-    
+    tools_used = []
     while iteration < max_iterations:
         iteration += 1
         preview = messages[-1]["content"][:40] + "..." if len(messages[-1]["content"]) > 40 else messages[-1]["content"]
@@ -212,7 +212,7 @@ async def AgentLoopCommon(
             # Execute tools
             for tool_call in response.tool_calls:
                 args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                
+                tools_used.append(tool_call.name)
                 # Log with appropriate level and format
                 if task_id:
                     logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
@@ -283,10 +283,11 @@ async def AgentLoopCommon(
         else:
             # logger.info(f"No tool call, the response is {origin_channel}:{origin_chat_id}: { response.content[:40] + '...' if response.content and len(response.content) > 40 else response.content}")
             # No tool calls, we're done
-            if response.content == "":
-                final_content = "reasoning content: " + response.reasoning_content
-            else:
-                final_content = response.content
+            
+            final_content = response.content
             break
+    if iteration >= max_iterations:
+        final_content = final_content or f"Max iterations {max_iterations} reached without completion."
+        logger.warning(f"Max iterations reached in agent loop for {origin_channel}:{origin_chat_id}")
     
-    return final_content, messages
+    return final_content, messages, tools_used

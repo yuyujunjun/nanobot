@@ -18,6 +18,7 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.agent.agent_utils import AgentLoopCommon
@@ -41,6 +42,7 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 20,
+        memory_window: int = 50,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
@@ -54,13 +56,19 @@ class AgentLoop:
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
+        self.memory_window = memory_window
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         
         self.context = ContextBuilder(workspace)
-        self.sessions = session_manager or SessionManager(workspace,[model])
+        self.sessions = session_manager or SessionManager(
+            workspace=workspace,
+            model=[self.model],
+            provider=provider,  # 注入 Provider 用于记忆整合
+            consolidation_model=self.model,
+        )
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -159,12 +167,13 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
     
-    async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+    async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
         """
         Process a single inbound message.
         
         Args:
             msg: The inbound message to process.
+            session_key: Override session key (used by process_direct).
         
         Returns:
             The response message, or None if no response needed.
@@ -178,10 +187,15 @@ class AgentLoop:
         user_key = f"{msg.channel}:{msg.chat_id}"
         session = self.sessions.get_or_create(user_key)
         
-        # 恢复 IOSystem 附加的权限信息
-        if 'session_permissions' in msg.metadata:
-            session.granted_permissions = msg.metadata['session_permissions']
         
+        
+        # Consolidate memory before processing if session is too large
+        if len(session.messages) > self.memory_window:
+            await self.sessions.consolidate_memory(
+                session=session,
+                memory_window=self.memory_window,
+            )
+            self.sessions.save(session)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -206,7 +220,7 @@ class AgentLoop:
         )
         
         # Agent loop using common function with IOManager
-        final_content, messages = await AgentLoopCommon(
+        final_content, messages,tools_used = await AgentLoopCommon(
             provider=self.provider,
             messages=messages,
             tools=self.tools,
@@ -217,16 +231,15 @@ class AgentLoop:
             origin_chat_id=msg.chat_id,
         )
         
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+        
         
         # Log response preview
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
         
-        # Save to session
+        # Save to session (include tool names so consolidation sees what happened)
         session.add_message("user", msg.content)
-        session.add_message("assistant", final_content)
+        session.add_message("assistant", final_content,tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
         
         return OutboundMessage(
@@ -309,7 +322,7 @@ class AgentLoop:
         )
         
         # Agent loop using common function
-        final_content, messages = await AgentLoopCommon(
+        final_content, messages,tools_used = await AgentLoopCommon(
             provider=self.provider,
             messages=messages,
             tools=self.tools,
@@ -334,6 +347,8 @@ class AgentLoop:
             content=final_content
         )
     
+
+
     async def process_direct(
         self,
         content: str,
@@ -346,9 +361,9 @@ class AgentLoop:
         
         Args:
             content: The message content.
-            session_key: Session identifier.
-            channel: Source channel (for context).
-            chat_id: Source chat ID (for context).
+            session_key: Session identifier (overrides channel:chat_id for session lookup).
+            channel: Source channel (for tool context routing).
+            chat_id: Source chat ID (for tool context routing).
         
         Returns:
             The agent's response.
@@ -360,5 +375,5 @@ class AgentLoop:
             content=content
         )
         
-        response = await self._process_message(msg)
+        response = await self._process_message(msg, session_key=session_key)
         return response.content if response else ""

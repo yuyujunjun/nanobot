@@ -311,11 +311,12 @@ class CommandHandler:
         Returns:
             Response message
         """
-        new_session = self.sessions.create_new_session(user_key)
+        # Create new session with memory consolidation
+        new_session = await self.sessions.create_new_session(user_key, consolidate_old=True)
         return (
             f"🆕 **New Session Created**\n\n"
-            f"New session key: `{new_session.key}`\n"
-            f"Use `/session switch {new_session.key}` to switch to this session."
+            f"🐈 Memory from previous session has been consolidated.\n"
+            f"New session key: `{new_session.key}`"
         )
     async def handle_reset(self, args: argparse.Namespace, user_key: str) -> str:
         """

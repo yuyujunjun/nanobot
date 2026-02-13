@@ -10,6 +10,13 @@ from loguru import logger
 
 from nanobot.utils.helpers import ensure_dir, safe_filename
 
+try:
+    from typing import TYPE_CHECKING
+    if TYPE_CHECKING:
+        from nanobot.providers.base import LLMProvider
+except ImportError:
+    pass
+
 
 @dataclass
 class SessionConfig:
@@ -132,11 +139,30 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
     
-    def __init__(self, workspace: Path, model):
+    def __init__(
+        self,
+        workspace: Path,
+        model: list[str],
+        provider: "LLMProvider | None" = None,
+        consolidation_model: str | None = None,
+    ):
+        """Initialize SessionManager.
+        
+        Args:
+            workspace: Workspace path for memory storage
+            model: List of available models
+            provider: Optional LLM provider for memory consolidation
+            consolidation_model: Model to use for consolidation (defaults to first model)
+        """
         self.workspace = workspace
         self.sessions_dir = ensure_dir(Path.home() / ".nanobot" / "sessions")
         self.models = model
         self.default_model = model[0]
+        
+        # Provider for memory consolidation
+        self.provider = provider
+        self.consolidation_model = consolidation_model or self.default_model
+        
         self._cache: dict[str, Session] = {}  # session_id -> Session
         # Map user_key (channel:chat_id) to current session_id
         self.session_table: dict[str, str] = {}  
@@ -273,16 +299,156 @@ class SessionManager:
         
         self._cache[session.key] = session
     
-    def create_new_session(self, user_key) -> str:
+    async def consolidate_memory(
+        self,
+        session: Session,
+        memory_window: int = 50,
+        archive_all: bool = False,
+    ) -> None:
+        """
+        Consolidate Session memory into MEMORY.md and HISTORY.md.
+        
+        This is part of Session lifecycle management:
+        - Called automatically when Session is too long
+        - Optionally called when creating a new Session
+        - Uses LLM to generate summaries and update long-term memory
+        
+        Args:
+            session: The session to consolidate
+            memory_window: Maximum messages to keep in session
+            archive_all: If True, archive all messages (for /new command)
+        """
+        if not self.provider:
+            logger.warning("No provider available for memory consolidation")
+            return
+        
+        if not session.messages:
+            return
+        
+        # Import at runtime to avoid circular dependency
+        from nanobot.agent.memory import MemoryStore
+        
+        memory = MemoryStore(self.workspace)
+        
+        # Determine which messages to archive
+        if archive_all:
+            old_messages = session.messages
+            keep_count = 0
+        else:
+            keep_count = min(10, max(2, memory_window // 2))
+            old_messages = session.messages[:-keep_count]
+        
+        if not old_messages:
+            return
+        
+        logger.info(
+            f"Memory consolidation: {len(session.messages)} messages, "
+            f"archiving {len(old_messages)}, keeping {keep_count}"
+        )
+        
+        # Format messages for LLM
+        lines = []
+        for m in old_messages:
+            if not m.get("content"):
+                continue
+            tools = (
+                f" [tools: {', '.join(m['tools_used'])}]"
+                if m.get("tools_used")
+                else ""
+            )
+            timestamp = m.get("timestamp", "?")[:16]
+            lines.append(
+                f"[{timestamp}] {m['role'].upper()}{tools}: {m['content']}"
+            )
+        
+        conversation = "\n".join(lines)
+        current_memory = memory.read_long_term()
+        
+        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
+
+1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+
+2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
+
+## Current Long-term Memory
+{current_memory or "(empty)"}
+
+## Conversation to Process
+{conversation}
+
+Respond with ONLY valid JSON, no markdown fences."""
+        
+        try:
+            response = await self.provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a memory consolidation agent. Respond only with valid JSON.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.consolidation_model,
+            )
+            
+            text = (response.content or "").strip()
+            
+            # Strip markdown code fences if present
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            
+            result = json.loads(text)
+            
+            # Update history file
+            if entry := result.get("history_entry"):
+                memory.append_history(entry)
+            
+            # Update long-term memory
+            if update := result.get("memory_update"):
+                if update != current_memory:
+                    memory.write_long_term(update)
+            
+            # Trim session
+            session.messages = session.messages[-keep_count:] if keep_count else []
+            
+            logger.info(
+                f"Memory consolidation done, session trimmed to {len(session.messages)} messages"
+            )
+            
+        except Exception as e:
+            logger.error(f"Memory consolidation failed: {e}")
+    
+    async def create_new_session(
+        self,
+        user_key: str,
+        consolidate_old: bool = True,
+    ) -> Session:
         """
         Create a new session for a user and switch to it.
+        
+        Args:
+            user_key: The user key (channel:chat_id)
+            consolidate_old: Whether to consolidate old session's memory
+        
         Returns:
-            The new session_id
+            The new Session object
         """
         import uuid
-        session_id = uuid.uuid4().hex[:12]
+        
+        # Consolidate old session if requested and available
+        if consolidate_old and self.provider:
+            old_session_id = self.session_table.get(user_key)
+            if old_session_id:
+                old_session = self._cache.get(old_session_id) or self._load(old_session_id)
+                if old_session and old_session.messages:
+                    logger.info(f"Consolidating old session {old_session_id}")
+                    await self.consolidate_memory(
+                        session=old_session,
+                        archive_all=True,
+                    )
+                    self.save(old_session)
         
         # Create new session
+        session_id = uuid.uuid4().hex[:12]
         session = Session(key=session_id)
         session.config.model = self.default_model
         

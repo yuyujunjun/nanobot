@@ -122,7 +122,7 @@ class SubagentManager:
             ]
             
             # Run agent loop using common function
-            final_result, messages = await AgentLoopCommon(
+            final_result, messages,tools_used = await AgentLoopCommon(
                 provider=self.provider,
                 messages=messages,
                 tools=tools,

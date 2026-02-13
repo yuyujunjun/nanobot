@@ -200,7 +200,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Always explain what you're doing before taking actions
 - Ask for clarification when the request is ambiguous
 - Use tools to help accomplish tasks
-- Remember important information in your memory files
+- Remember important information in memory/MEMORY.md; past events are logged in memory/HISTORY.md
 """,
         "SOUL.md": """# Soul
 
@@ -258,6 +258,11 @@ This file stores important information that should persist across sessions.
 (Things to remember)
 """)
         console.print("  [dim]Created memory/MEMORY.md[/dim]")
+    
+    history_file = memory_dir / "HISTORY.md"
+    if not history_file.exists():
+        history_file.write_text("")
+        console.print("  [dim]Created memory/HISTORY.md[/dim]")
 
     # Create skills directory for custom user skills
     skills_dir = workspace / "skills"
@@ -311,7 +316,7 @@ def gateway(
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path,[config.agents.defaults.model])
+    session_manager = SessionManager(config.workspace_path,[config.agents.defaults.model],provider=provider)
     
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -324,6 +329,7 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -363,7 +369,7 @@ def gateway(
     )
     
     # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    channels = ChannelManager(config, bus)
     
     io_system = IOSystem(session_manager,bus)
     if channels.enabled_channels:
@@ -432,7 +438,7 @@ def tui(
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
@@ -456,6 +462,9 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -655,14 +664,20 @@ def _get_bridge_dir() -> Path:
 def channels_login():
     """Link device via QR code."""
     import subprocess
+    from nanobot.config.loader import load_config
     
+    config = load_config()
     bridge_dir = _get_bridge_dir()
     
     console.print(f"{__logo__} Starting bridge...")
     console.print("Scan the QR code to connect.\n")
     
+    env = {**os.environ}
+    if config.channels.whatsapp.bridge_token:
+        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
+    
     try:
-        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True)
+        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
