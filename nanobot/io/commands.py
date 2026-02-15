@@ -394,15 +394,7 @@ class CommandHandler:
                     
                     lines.append("")  # Empty line between commands
         
-        # Add permission management commands (handled by IOManager)
-        lines.extend([
-            "**Permission Management:**",
-            "🔐 `/grant <request_id> <permission> [--mode one-time|persistent]` - Grant command permissions",
-            "   Example: `/grant abc123 net file_write --mode persistent`",
-            "🔐 `/deny <request_id>` - Deny permission request",
-            "   Example: `/deny abc123`",
-            ""
-        ])
+
         
         # Add tips
         lines.extend([
