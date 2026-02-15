@@ -38,8 +38,10 @@ dependencies = [
     "slack-sdk>=3.26.0",
     "qq-botpy>=1.0.0",
     "python-socks[asyncio]>=2.4.0",
-    "prompt_toolkit>=3.0.0",
     "questionary>=1.10.0",
+    "prompt-toolkit>=3.0.0",
+    "mcp>=1.0.0",
+    "json-repair>=0.30.0",
 ]
 
 [project.optional-dependencies]

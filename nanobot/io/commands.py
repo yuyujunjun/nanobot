@@ -88,7 +88,7 @@ class CommandHandler:
         session_parser.epilog = 'Example: /session switch abc123'
         
         # /reset command
-        reset_parser = subparsers.add_parser(
+        subparsers.add_parser(
             'reset', 
             help='🔄 Reset Session',
             description='Clear all messages in current session (preserves configuration)'
@@ -101,12 +101,6 @@ class CommandHandler:
             description='Create a new conversation session'
         )
         
-        # /status command
-        subparsers.add_parser(
-            'status', 
-            help='📊 Bot Status',
-            description='Show current bot and session status'
-        )
         
         # Note: /grant and /deny are handled by IOManager, not by CommandHandler
         # /help command
@@ -148,8 +142,6 @@ class CommandHandler:
                 return await self.handle_reset(parsed_args, user_key)
             elif parsed_args.command == 'new':
                 return await self.handle_new(user_key)
-            elif parsed_args.command == 'status':
-                return self.handle_status(user_key)
             elif parsed_args.command == 'help':
                 return self.handle_help()
             else:
@@ -210,6 +202,8 @@ class CommandHandler:
             return self._handle_session_list(user_key)
         elif action == 'info' or action is None:
             return self._handle_session_info(user_key)
+        elif action == 'consolidate':
+            return await self._handle_session_consolidate(user_key)
         else:
             # Treat as session ID to switch to
             return self._handle_session_switch(user_key,action)
@@ -290,7 +284,25 @@ class CommandHandler:
                 lines.append("One-time: none")
         
         return "\n".join(lines)
+    async def _handle_session_consolidate(self, user_key: str) -> str:
+        """Consolidate current session's memory."""
+        session = self.sessions.get_or_create(user_key)
+        
+        if not session.messages:
+            return "ℹ️ No messages to consolidate in current session."
+        
+        message_count = len(session.messages)
+        
+        try:
+            consolidate,response = await self.sessions.consolidate_memory(session, archive_all=False)
+            if consolidate:
+                self.sessions.save(session)
+            return f"{response}"
+        except Exception as e:
+            logger.error(f"Consolidation failed: {e}")
+            return f"❌ Failed to consolidate memory: {str(e)}"
     
+   
     def _handle_session_switch(self, user_key: str, session_id: str) -> str:
         """Switch to another session."""
         # Note: In current architecture, session switching is handled by channel/client
@@ -312,10 +324,9 @@ class CommandHandler:
             Response message
         """
         # Create new session with memory consolidation
-        new_session = await self.sessions.create_new_session(user_key, consolidate_old=True)
+        new_session = self.sessions.create_new_session(user_key)
         return (
             f"🆕 **New Session Created**\n\n"
-            f"🐈 Memory from previous session has been consolidated.\n"
             f"New session key: `{new_session.key}`"
         )
     async def handle_reset(self, args: argparse.Namespace, user_key: str) -> str:

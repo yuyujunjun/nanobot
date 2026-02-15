@@ -182,9 +182,7 @@ async def AgentLoopCommon(
             model=model
         )
         
-        # Handle tool calls
         if response.has_tool_calls:
-            # Add assistant message with tool calls
             tool_call_dicts = [
                 {
                     "id": tc.id,
@@ -208,7 +206,7 @@ async def AgentLoopCommon(
                     "content": response.content or "",
                     "tool_calls": tool_call_dicts,
                 })
-            logger.info(response.reasoning_content)
+            
             # Execute tools
             for tool_call in response.tool_calls:
                 args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -283,7 +281,6 @@ async def AgentLoopCommon(
         else:
             # logger.info(f"No tool call, the response is {origin_channel}:{origin_chat_id}: { response.content[:40] + '...' if response.content and len(response.content) > 40 else response.content}")
             # No tool calls, we're done
-            
             final_content = response.content
             break
     if iteration >= max_iterations:
@@ -291,3 +288,60 @@ async def AgentLoopCommon(
         logger.warning(f"Max iterations reached in agent loop for {origin_channel}:{origin_chat_id}")
     
     return final_content, messages, tools_used
+async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+        """
+        Run the agent iteration loop.
+
+        Args:
+            initial_messages: Starting messages for the LLM conversation.
+
+        Returns:
+            Tuple of (final_content, list_of_tools_used).
+        """
+        messages = initial_messages
+        iteration = 0
+        final_content = None
+        tools_used: list[str] = []
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                )
+
+                for tool_call in response.tool_calls:
+                    tools_used.append(tool_call.name)
+                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result
+                    )
+                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+            else:
+                final_content = response.content
+                break
+
+        return final_content, tools_used

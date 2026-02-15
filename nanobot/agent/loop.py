@@ -1,6 +1,7 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 from pathlib import Path
 from typing import Any
@@ -18,15 +19,15 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
-from nanobot.session.manager import SessionManager
+from nanobot.session.manager import Session, SessionManager
+from nanobot.io.commands import CommandHandler
 from nanobot.agent.agent_utils import AgentLoopCommon
 
 class AgentLoop:
     """
     The agent loop is the core processing engine.
-    
+
     It:
     1. Receives messages from the bus
     2. Builds context with history, memory, skills
@@ -34,7 +35,7 @@ class AgentLoop:
     4. Executes tool calls
     5. Sends responses back
     """
-    
+
     def __init__(
         self,
         bus: MessageBus,
@@ -42,12 +43,15 @@ class AgentLoop:
         workspace: Path,
         model: str | None = None,
         max_iterations: int = 20,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
         memory_window: int = 50,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        mcp_servers: dict | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -56,12 +60,14 @@ class AgentLoop:
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self.memory_window = memory_window
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-        
+
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(
             workspace=workspace,
@@ -75,12 +81,17 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
         
         self._running = False
+        self._mcp_servers = mcp_servers or {}
+        self._mcp_stack: AsyncExitStack | None = None
+        self._mcp_connected = False
         self._register_default_tools()
     
     def _get_session_config_value(self, session: "Session", key: str, default: Any) -> Any:
@@ -133,27 +144,50 @@ class AgentLoop:
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
     
+    async def _connect_mcp(self) -> None:
+        """Connect to configured MCP servers (one-time, lazy)."""
+        if self._mcp_connected or not self._mcp_servers:
+            return
+        self._mcp_connected = True
+        from nanobot.agent.tools.mcp import connect_mcp_servers
+        self._mcp_stack = AsyncExitStack()
+        await self._mcp_stack.__aenter__()
+        await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
+
+    def _set_tool_context(self, channel: str, chat_id: str) -> None:
+        """Update context for all tools that need routing info."""
+        if message_tool := self.tools.get("message"):
+            if isinstance(message_tool, MessageTool):
+                message_tool.set_context(channel, chat_id)
+
+        if spawn_tool := self.tools.get("spawn"):
+            if isinstance(spawn_tool, SpawnTool):
+                spawn_tool.set_context(channel, chat_id)
+
+        if cron_tool := self.tools.get("cron"):
+            if isinstance(cron_tool, CronTool):
+                cron_tool.set_context(channel, chat_id)
+
+
+
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
+        await self._connect_mcp()
         logger.info("Agent loop started")
-        
+
         while self._running:
             try:
-                # Wait for next message
                 msg = await asyncio.wait_for(
                     self.bus.consume_agent(),
                     timeout=1.0
                 )
-                
-                # Process it
                 try:
                     response = await self._process_message(msg)
                     if response:
                         await self.bus.publish_outbound(response)
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
-                    # Send error response
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
@@ -162,6 +196,15 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
     
+    async def close_mcp(self) -> None:
+        """Close MCP connections."""
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                pass  # MCP SDK cancel scope cleanup is noisy but harmless
+            self._mcp_stack = None
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -178,8 +221,7 @@ class AgentLoop:
         Returns:
             The response message, or None if no response needed.
         """
-        # Handle system messages (subagent announces)
-        # The chat_id contains the original "channel:chat_id" to route back to
+        # System messages route back via chat_id ("channel:chat_id")
         if msg.channel == "system":
             return await self._process_system_message(msg)
         
@@ -233,11 +275,9 @@ class AgentLoop:
         
         
         
-        # Log response preview
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
         
-        # Save to session (include tool names so consolidation sees what happened)
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content,tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
@@ -296,26 +336,11 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
         
-        # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
-        
-        # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(origin_channel, origin_chat_id)
-        
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(origin_channel, origin_chat_id)
-        
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(origin_channel, origin_chat_id)
-        
-        # Build messages with the announce content
-        messages = self.context.build_messages(
-            history=session.get_history(),
+        self._set_tool_context(origin_channel, origin_chat_id)
+        initial_messages = self.context.build_messages(
+            history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
             channel=origin_channel,
             chat_id=origin_chat_id,
@@ -336,7 +361,6 @@ class AgentLoop:
         if final_content is None:
             final_content = "Background task completed."
         
-        # Save to session (mark as system message in history)
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
@@ -346,8 +370,6 @@ class AgentLoop:
             chat_id=origin_chat_id,
             content=final_content
         )
-    
-
 
     async def process_direct(
         self,
@@ -368,6 +390,7 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
+        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",

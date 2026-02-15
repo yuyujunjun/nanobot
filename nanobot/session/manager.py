@@ -1,10 +1,12 @@
 """Session management for conversation history."""
 
+import asyncio
 import json
+import json_repair
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
@@ -38,21 +40,28 @@ class SessionConfig:
         """Create from dict."""
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMProvider
+
 
 @dataclass
 class Session:
     """
     A conversation session.
-    
+
     Stores messages in JSONL format for easy reading and persistence.
-    Each session has its own configuration (model, temperature, etc.).
+
+    Important: Messages are append-only for LLM cache efficiency.
+    The consolidation process writes summaries to MEMORY.md/HISTORY.md
+    but does NOT modify the messages list or get_history() output.
     """
-    
+
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    last_consolidated: int = 0  # Number of messages already consolidated to files
     config: SessionConfig = field(default_factory=SessionConfig)
     granted_permissions: dict[str, Any] = field(default_factory=lambda: {
         'persistent': set(),  # Permissions granted for all commands
@@ -71,27 +80,17 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
     
-    def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
-        """
-        Get message history for LLM context.
-        
-        Args:
-            max_messages: Maximum messages to return.
-        
-        Returns:
-            List of messages in LLM format.
-        """
-        # Get recent messages
-        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
-        
-        # Convert to LLM format (just role and content)
-        return [{"role": m["role"], "content": m["content"]} for m in recent]
+    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
+        """Get recent messages in LLM format (role + content only)."""
+        return [{"role": m["role"], "content": m["content"]} for m in self.messages[-max_messages:]]
     
     def clear(self) -> None:
-        """Clear all messages in the session."""
+        """Clear all messages and reset session to initial state."""
         self.messages = []
+        self.last_consolidated = 0
         self.updated_at = datetime.now()
     
+
     def grant_permission(self, permissions: set[str], mode: str = 'persistent', cmd_hash: str | None = None) -> None:
         """
         Grant permissions for command execution.
@@ -128,14 +127,12 @@ class Session:
                 if not self.granted_permissions['one_time'][cmd_hash]:
                     del self.granted_permissions['one_time'][cmd_hash]
         self.updated_at = datetime.now()
-        self.messages = []
-        self.updated_at = datetime.now()
 
 
 class SessionManager:
     """
     Manages conversation sessions.
-    
+
     Sessions are stored as JSONL files in the sessions directory.
     """
     
@@ -230,22 +227,23 @@ class SessionManager:
         
         if not path.exists():
             return None
-        
+
         try:
             messages = []
             metadata = {}
             created_at = None
             config = SessionConfig()
             granted_permissions = {'persistent': set(), 'one_time': {}}
-            
+            last_consolidated = 0
+
             with open(path) as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
-                    
+
                     data = json.loads(line)
-                    
+
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
@@ -259,16 +257,18 @@ class SessionManager:
                                 'persistent': set(perms_data.get("persistent", [])),
                                 'one_time': {k: set(v) for k, v in perms_data.get("one_time", {}).items()}
                             }
+                        last_consolidated = data.get("last_consolidated", 0)
                     else:
                         messages.append(data)
-            
+
             return Session(
                 key=session_id,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
                 config=config,
-                granted_permissions=granted_permissions
+                granted_permissions=granted_permissions,
+                last_consolidated=last_consolidated
             )
         except Exception as e:
             logger.warning(f"Failed to load session {session_id}: {e}")
@@ -277,14 +277,14 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
-        
+
         with open(path, "w") as f:
-            # Write metadata first
             metadata_line = {
                 "_type": "metadata",
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
+                "last_consolidated": session.last_consolidated,
                 "config": session.config.to_dict(),  # Save session config
                 "granted_permissions": {
                     "persistent": list(session.granted_permissions.get("persistent", set())),
@@ -299,193 +299,7 @@ class SessionManager:
         
         self._cache[session.key] = session
     
-    async def consolidate_memory(
-        self,
-        session: Session,
-        memory_window: int = 50,
-        archive_all: bool = False,
-    ) -> None:
-        """
-        Consolidate Session memory into MEMORY.md and HISTORY.md.
-        
-        This is part of Session lifecycle management:
-        - Called automatically when Session is too long
-        - Optionally called when creating a new Session
-        - Uses LLM to generate summaries and update long-term memory
-        
-        Args:
-            session: The session to consolidate
-            memory_window: Maximum messages to keep in session
-            archive_all: If True, archive all messages (for /new command)
-        """
-        if not self.provider:
-            logger.warning("No provider available for memory consolidation")
-            return
-        
-        if not session.messages:
-            return
-        
-        # Import at runtime to avoid circular dependency
-        from nanobot.agent.memory import MemoryStore
-        
-        memory = MemoryStore(self.workspace)
-        
-        # Determine which messages to archive
-        if archive_all:
-            old_messages = session.messages
-            keep_count = 0
-        else:
-            keep_count = min(10, max(2, memory_window // 2))
-            old_messages = session.messages[:-keep_count]
-        
-        if not old_messages:
-            return
-        
-        logger.info(
-            f"Memory consolidation: {len(session.messages)} messages, "
-            f"archiving {len(old_messages)}, keeping {keep_count}"
-        )
-        
-        # Format messages for LLM
-        lines = []
-        for m in old_messages:
-            if not m.get("content"):
-                continue
-            tools = (
-                f" [tools: {', '.join(m['tools_used'])}]"
-                if m.get("tools_used")
-                else ""
-            )
-            timestamp = m.get("timestamp", "?")[:16]
-            lines.append(
-                f"[{timestamp}] {m['role'].upper()}{tools}: {m['content']}"
-            )
-        
-        conversation = "\n".join(lines)
-        current_memory = memory.read_long_term()
-        
-        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
-
-1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
-
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
-
-## Current Long-term Memory
-{current_memory or "(empty)"}
-
-## Conversation to Process
-{conversation}
-
-Respond with ONLY valid JSON, no markdown fences."""
-        
-        try:
-            response = await self.provider.chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a memory consolidation agent. Respond only with valid JSON.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                model=self.consolidation_model,
-            )
-            
-            text = (response.content or "").strip()
-            
-            # Strip markdown code fences if present
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            
-            result = json.loads(text)
-            
-            # Update history file
-            if entry := result.get("history_entry"):
-                memory.append_history(entry)
-            
-            # Update long-term memory
-            if update := result.get("memory_update"):
-                if update != current_memory:
-                    memory.write_long_term(update)
-            
-            # Trim session
-            session.messages = session.messages[-keep_count:] if keep_count else []
-            
-            logger.info(
-                f"Memory consolidation done, session trimmed to {len(session.messages)} messages"
-            )
-            
-        except Exception as e:
-            logger.error(f"Memory consolidation failed: {e}")
     
-    async def create_new_session(
-        self,
-        user_key: str,
-        consolidate_old: bool = True,
-    ) -> Session:
-        """
-        Create a new session for a user and switch to it.
-        
-        Args:
-            user_key: The user key (channel:chat_id)
-            consolidate_old: Whether to consolidate old session's memory
-        
-        Returns:
-            The new Session object
-        """
-        import uuid
-        
-        # Consolidate old session if requested and available
-        if consolidate_old and self.provider:
-            old_session_id = self.session_table.get(user_key)
-            if old_session_id:
-                old_session = self._cache.get(old_session_id) or self._load(old_session_id)
-                if old_session and old_session.messages:
-                    logger.info(f"Consolidating old session {old_session_id}")
-                    await self.consolidate_memory(
-                        session=old_session,
-                        archive_all=True,
-                    )
-                    self.save(old_session)
-        
-        # Create new session
-        session_id = uuid.uuid4().hex[:12]
-        session = Session(key=session_id)
-        session.config.model = self.default_model
-        
-        # Update mapping
-        old_session_id = self.session_table.get(user_key)
-        self.session_table[user_key] = session_id
-        self._save_session_table()
-        
-        # Cache it
-        self._cache[session_id] = session
-        self.save(session)
-        
-        logger.info(f"Created new session {session_id} for {user_key} (previous: {old_session_id})")
-        return session
-    
-    def switch_session(self, user_key, session_id: str) -> bool:
-        """
-        Switch user to a specific session.
-        Returns:
-            True if successful, False if session not found
-        """
-       
-        
-        # Check if session exists
-        session = self._load(session_id)
-        if not session:
-            logger.warning(f"Cannot switch to non-existent session {session_id}")
-            return False
-            # raise ValueError(f"Session {session_id} not found")
-        
-        # Update mapping
-        old_session_id = self.session_table.get(user_key)
-        self.session_table[user_key] = session_id
-        self._save_session_table()
-        
-        logger.info(f"Switched {user_key} from {old_session_id} to {session_id}")
-        return True
     
     def get_user_sessions(self, user_key) -> list[str]:
         """
@@ -496,26 +310,6 @@ Respond with ONLY valid JSON, no markdown fences."""
 
         # This is a simple implementation; you might want to track this explicitly
         return [sid for uk, sid in self.session_table.items() if uk == user_key]
-    
-    def delete(self, key: str) -> bool:
-        """
-        Delete a session.
-        
-        Args:
-            key: Session key.
-        
-        Returns:
-            True if deleted, False if not found.
-        """
-        # Remove from cache
-        self._cache.pop(key, None)
-        
-        # Remove file
-        path = self._get_session_path(key)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
     
     def list_sessions(self) -> list[dict[str, Any]]:
         """
@@ -528,6 +322,8 @@ Respond with ONLY valid JSON, no markdown fences."""
         
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
+                session_id = path.stem.replace("_", ":")
+                session = self._cache.get(session_id) or self._load(session_id)
                 # Read just the metadata line
                 with open(path) as f:
                     first_line = f.readline().strip()
@@ -538,6 +334,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                                 "key": path.stem.replace("_", ":"),
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
+                                "message_count": len(session.messages) if session else 0,
                                 "path": str(path)
                             })
             except Exception:
@@ -562,6 +359,126 @@ Respond with ONLY valid JSON, no markdown fences."""
         session.config.model = model
         self.save(session)
     
+
+    
+    async def consolidate_memory(
+        self, 
+        session: "Session", 
+        archive_all: bool = False,
+        memory_window: int = 50
+    ) -> None:
+        """Consolidate old messages into MEMORY.md + HISTORY.md.
+        
+        Args:
+            session: The session to consolidate.
+            provider: LLM provider for consolidation analysis.
+            model: Model name to use for consolidation.
+            archive_all: If True, archive all messages. If False, only archive old ones.
+            memory_window: Window size for keeping recent messages.
+        """
+        provider = self.provider
+        model = session.config.model
+        from nanobot.agent.memory import MemoryStore
+        
+        memory = MemoryStore(self.workspace)
+
+        if archive_all:
+            old_messages = session.messages
+            keep_count = 0
+            logger.info(f"Memory consolidation (archive_all): {len(session.messages)} total messages archived")
+        else:
+            keep_count = memory_window // 2
+            if len(session.messages) <= keep_count:
+                logger.debug(f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})")
+                return [False, f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})"]
+
+            messages_to_process = len(session.messages) - session.last_consolidated
+            if messages_to_process <= 0:
+                logger.debug(f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})")
+                return [False, f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})"]
+
+            old_messages = session.messages[session.last_consolidated:-keep_count]
+            if not old_messages:
+                return [False, f"Session {session.key}: No messages to consolidate after applying keep window (keep={keep_count})"]
+            logger.info(f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep")
+
+        lines = []
+        for m in old_messages:
+            if not m.get("content"):
+                continue
+            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
+            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+        conversation = "\n".join(lines)
+        current_memory = memory.read_long_term()
+
+        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
+
+1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
+
+2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
+
+## Current Long-term Memory
+{current_memory or "(empty)"}
+
+## Conversation to Process
+{conversation}
+
+Respond with ONLY valid JSON, no markdown fences."""
+
+        try:
+            response = await provider.chat(
+                messages=[
+                    {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                model=model,
+            )
+            text = (response.content or "").strip()
+            if not text:
+                logger.warning("Memory consolidation: LLM returned empty response, skipping")
+                return [False, "Error: LLM returned empty response"]
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            result = json_repair.loads(text)
+            if not isinstance(result, dict):
+                logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
+                return [False, "Error: unexpected response type, skipping"]
+
+            if entry := result.get("history_entry"):
+                memory.append_history(entry)
+            if update := result.get("memory_update"):
+                if update != current_memory:
+                    memory.write_long_term(update)
+
+            if archive_all:
+                session.last_consolidated = 0
+            else:
+                session.last_consolidated = len(session.messages) - keep_count
+            logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
+            session.messages = session.messages[-keep_count:] 
+            return [True, f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}"]
+
+        except Exception as e:
+            logger.error(f"Memory consolidation failed: {e}")
+            return [False, f"Error during memory consolidation: {e}"]
+    def create_new_session(self,user_key: str) -> Session:
+        # Create new session
+        import uuid
+        session_id = uuid.uuid4().hex[:12]
+        session = Session(key=session_id)
+        # Update mapping
+        old_session_id = self.session_table.get(user_key)
+        self.session_table[user_key] = session_id
+        self._save_session_table()
+        
+        # Cache it
+        self._cache[session_id] = session
+        self.save(session)
+        
+        logger.info(f"Created new session {session_id} for {user_key} (previous: {old_session_id})")
+        return session
+
+    
     def get_session_info(self, user_key) -> dict[str, Any]:
         """
         Returns:
@@ -583,3 +500,46 @@ Respond with ONLY valid JSON, no markdown fences."""
                 "one_time": {k: list(v) for k, v in session.granted_permissions.get("one_time", {}).items()}
             }
         }
+    
+    
+    def switch_session(self, user_key, session_id: str) -> bool:
+        """
+        Switch user to a specific session.
+        Returns:
+            True if successful, False if session not found
+        """
+       
+        
+        # Check if session exists
+        session = self._load(session_id)
+        if not session:
+            logger.warning(f"Cannot switch to non-existent session {session_id}")
+            return False
+            # raise ValueError(f"Session {session_id} not found")
+        
+        # Update mapping
+        old_session_id = self.session_table.get(user_key)
+        self.session_table[user_key] = session_id
+        self._save_session_table()
+        
+        logger.info(f"Switched {user_key} from {old_session_id} to {session_id}")
+        return True
+    
+    def delete(self, key: str) -> bool:
+        """
+        Delete a session.
+        
+        Args:
+            key: Session key.
+        
+        Returns:
+            True if deleted, False if not found.
+        """
+        # Remove from cache
+        self._cache.pop(key, None)
+        # Remove file
+        path = self._get_session_path(key)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
