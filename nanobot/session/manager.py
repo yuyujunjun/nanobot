@@ -82,7 +82,9 @@ class Session:
     
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Get recent messages in LLM format (role + content only)."""
-        return [{"role": m["role"], "content": m["content"]} for m in self.messages[-max_messages:]]
+        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        
+        return  [{"role": m["role"], "content": m["content"]} for m in recent]
     
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
