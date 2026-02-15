@@ -268,7 +268,7 @@ class AgentLoop:
         if msg.content.strip().startswith("/"):
             cmd_response = await self.command_handler.process(
                 msg, 
-                session,
+                key,
                 provider=self.provider,
                 model=self.model,
                 memory_window=self.memory_window

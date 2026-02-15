@@ -68,6 +68,30 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(Path.home() / ".nanobot" / "sessions")
         self._cache: dict[str, Session] = {}
+        # Map user_key (channel:chat_id) to current session_id
+        self.session_table: dict[str, str] = {}  
+        self.session_table_path = self.sessions_dir / "session_table.json"
+        self._load_session_table()
+    def _load_session_table(self) -> None:
+        """Load session_table from disk."""
+        if self.session_table_path.exists():
+            try:
+                with open(self.session_table_path) as f:
+                    self.session_table = json.load(f)
+                logger.info(f"Loaded session table with {len(self.session_table)} entries")
+            except Exception as e:
+                logger.warning(f"Failed to load session table: {e}")
+                self.session_table = {}
+        else:
+            self.session_table = {}
+    
+    def _save_session_table(self) -> None:
+        """Save session_table to disk."""
+        try:
+            with open(self.session_table_path, "w") as f:
+                json.dump(self.session_table, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to save session table: {e}")
     
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -84,18 +108,31 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        # Create user_key
+        # user_key = f"{channel}:{chat_id}"
         
-        session = self._load(key)
-        if session is None:
-            session = Session(key=key)
+        # Check if user has a current session
+        session_id = self.session_table.get(key)
         
-        self._cache[key] = session
-        return session
+        if session_id:
+            # Check cache first
+            if session_id in self._cache:
+                return self._cache[session_id]
+            
+            session = self._load(session_id)
+            if session:
+                self._cache[session_id] = session
+                return session
+            else:
+                # Session file missing, create new one
+                logger.warning(f"Session {session_id} not found, creating new one")
+        
+        # Create new session
+        return self.create_new_session(key)
+
     
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """Load a session from disk by session_id."""
         path = self._get_session_path(key)
 
         if not path.exists():
@@ -151,10 +188,6 @@ class SessionManager:
 
         self._cache[session.key] = session
     
-    def invalidate(self, key: str) -> None:
-        """Remove a session from the in-memory cache."""
-        self._cache.pop(key, None)
-    
     def list_sessions(self) -> list[dict[str, Any]]:
         """
         List all sessions.
@@ -166,6 +199,8 @@ class SessionManager:
         
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
+                session_id = path.stem.replace("_", ":")
+                session = self._cache.get(session_id) or self._load(session_id)
                 # Read just the metadata line
                 with open(path) as f:
                     first_line = f.readline().strip()
@@ -176,6 +211,7 @@ class SessionManager:
                                 "key": path.stem.replace("_", ":"),
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
+                                "message_count": len(session.messages) if session else 0,
                                 "path": str(path)
                             })
             except Exception:
@@ -212,16 +248,16 @@ class SessionManager:
             keep_count = memory_window // 2
             if len(session.messages) <= keep_count:
                 logger.debug(f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})")
-                return
+                return [False, f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})"]
 
             messages_to_process = len(session.messages) - session.last_consolidated
             if messages_to_process <= 0:
                 logger.debug(f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})")
-                return
+                return [False, f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})"]
 
             old_messages = session.messages[session.last_consolidated:-keep_count]
             if not old_messages:
-                return
+                return [False, f"Session {session.key}: No messages to consolidate after applying keep window (keep={keep_count})"]
             logger.info(f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep")
 
         lines = []
@@ -258,13 +294,13 @@ Respond with ONLY valid JSON, no markdown fences."""
             text = (response.content or "").strip()
             if not text:
                 logger.warning("Memory consolidation: LLM returned empty response, skipping")
-                return
+                return [False, "Error: LLM returned empty response"]
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             result = json_repair.loads(text)
             if not isinstance(result, dict):
                 logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
-                return
+                return [False, "Error: unexpected response type, skipping"]
 
             if entry := result.get("history_entry"):
                 memory.append_history(entry)
@@ -277,44 +313,83 @@ Respond with ONLY valid JSON, no markdown fences."""
             else:
                 session.last_consolidated = len(session.messages) - keep_count
             logger.info(f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}")
+            session.messages = session.messages[-keep_count:] 
+            return [True, f"Memory consolidation done: {len(session.messages)} messages, last_consolidated={session.last_consolidated}"]
+
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
+            return [False, f"Error during memory consolidation: {e}"]
+    def create_new_session(self,user_key: str) -> Session:
+        # Create new session
+        import uuid
+        session_id = uuid.uuid4().hex[:12]
+        session = Session(key=session_id)
+        # Update mapping
+        old_session_id = self.session_table.get(user_key)
+        self.session_table[user_key] = session_id
+        self._save_session_table()
+        
+        # Cache it
+        self._cache[session_id] = session
+        self.save(session)
+        
+        logger.info(f"Created new session {session_id} for {user_key} (previous: {old_session_id})")
+        return session
+
     
-    async def create_new_session(
-        self, 
-        session: "Session",
-        provider: "LLMProvider",
-        model: str,
-        memory_window: int = 50
-    ) -> None:
+    def get_session_info(self, user_key) -> dict[str, Any]:
         """
-        Create a new session by clearing the current one and consolidating the old messages.
+        Returns:
+            Dict with session info.
+        """
+        session = self.get_or_create(user_key)
+        return {
+            "session_id": session.key,
+            "user_key": user_key,
+            "message_count": len(session.messages),
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+        }
+    
+    
+    def switch_session(self, user_key, session_id: str) -> bool:
+        """
+        Switch user to a specific session.
+        Returns:
+            True if successful, False if session not found
+        """
+       
+        
+        # Check if session exists
+        session = self._load(session_id)
+        if not session:
+            logger.warning(f"Cannot switch to non-existent session {session_id}")
+            return False
+            # raise ValueError(f"Session {session_id} not found")
+        
+        # Update mapping
+        old_session_id = self.session_table.get(user_key)
+        self.session_table[user_key] = session_id
+        self._save_session_table()
+        
+        logger.info(f"Switched {user_key} from {old_session_id} to {session_id}")
+        return True
+    
+    def delete(self, key: str) -> bool:
+        """
+        Delete a session.
         
         Args:
-            session: The current session to be reset.
-            provider: LLM provider for memory consolidation.
-            model: Model name for consolidation.
-            memory_window: Memory window size for consolidation.
+            key: Session key.
+        
+        Returns:
+            True if deleted, False if not found.
         """
-        # Copy messages before clearing (avoid race condition with background task)
-        messages_to_archive = session.messages.copy()
-        
-        # Clear the session
-        session.clear()
-        self.save(session)
-        self.invalidate(session.key)
-        
-        # Schedule memory consolidation in the background
-        async def _consolidate_and_cleanup():
-            temp_session = Session(key=session.key)
-            temp_session.messages = messages_to_archive
-            await self.consolidate_memory(
-                temp_session,
-                provider=provider,
-                model=model,
-                archive_all=True,
-                memory_window=memory_window
-            )
-        
-        asyncio.create_task(_consolidate_and_cleanup())
-        logger.info(f"New session created: {session.key}")
+        # Remove from cache
+        self._cache.pop(key, None)
+        # Remove file
+        path = self._get_session_path(key)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
