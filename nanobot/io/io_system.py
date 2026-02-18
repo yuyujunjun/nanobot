@@ -77,14 +77,21 @@ class IOSystem:
         request_id, request = next(iter(session.pending_permissions.items()))
         
         if user_reply in ['yes', 'y']:
-            # Grant all required permissions (persistent mode)
-            # Update session.granted_permissions directly here
-            session.granted_permissions['persistent'].update(request.required_permissions)
+            default_mode = getattr(request, 'default_grant_mode', 'persistent')
+            if default_mode == 'one-time' and getattr(request, 'command_hash', None):
+                cmd_hash = request.command_hash
+                if cmd_hash not in session.granted_permissions['one_time']:
+                    session.granted_permissions['one_time'][cmd_hash] = set()
+                session.granted_permissions['one_time'][cmd_hash].update(request.required_permissions)
+                granted_mode = 'one-time'
+            else:
+                session.granted_permissions['persistent'].update(request.required_permissions)
+                granted_mode = 'persistent'
             
             # Mark request as granted
             request.granted = True
             request.granted_permissions = request.required_permissions
-            request.mode = "persistent"
+            request.mode = granted_mode
             
             # Trigger event to wake up wait_for_permission
             request.event.set()
@@ -92,13 +99,12 @@ class IOSystem:
             # Clean up pending request
             session.pending_permissions.pop(request_id, None)
             
-            logger.info(f"Permission granted (yes) for request {request_id}: {request.required_permissions}")
-            logger.info(f"Updated session.granted_permissions['persistent']: {session.granted_permissions['persistent']}")
+            logger.info(f"Permission granted (yes) for request {request_id}: {request.required_permissions} ({granted_mode})")
             
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content=f"✅ Permissions granted: {', '.join(request.required_permissions)} (persistent)"
+                content=f"✅ Permissions granted: {', '.join(request.required_permissions)} ({granted_mode})"
             )
         else:  # no, n
             # Deny all permissions

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.permissions import PermissionGate
 
 import bashlex
 import ast
@@ -200,6 +201,7 @@ class ExecTool(Tool):
         self.working_dir = working_dir
         self.restrict_to_workspace = restrict_to_workspace
         self.security_analyzer = SecurityAnalyzer()
+        self.permission_gate = PermissionGate()
     
     @property
     def name(self) -> str:
@@ -235,49 +237,54 @@ class ExecTool(Tool):
             if path_error:
                 # 如果是 Warning，转换为需要权限
                 if path_error.startswith("Warning:"):
-                    # 将警告转换为权限请求
-                    return path_error.replace("Warning:", "⚠️ Warning:") + "\n\nThis check may have false positives. The command will proceed after permission is granted."
+                    permission_request = self.permission_gate.check_or_request(
+                        session=session,
+                        subject=command,
+                        required_permissions={"path_outside_workspace"},
+                        details={
+                            "path_outside_workspace": (
+                                path_error.replace("Warning:", "").strip()
+                            )
+                        },
+                        risk_level="medium",
+                        default_grant_mode="one-time",
+                    )
+                    if permission_request:
+                        return permission_request
                 else:
                     # Error 直接阻止
                     return path_error
         
         # 2. 检查是否是危险的脚本执行
         is_dangerous, danger_reason = self._is_dangerous_command(command)
-        if is_dangerous and session:
-            # 检查是否已有 proc_exec 权限
-            has_proc_exec = False
-            if hasattr(session, 'granted_permissions'):
-                has_proc_exec = 'proc_exec' in session.granted_permissions.get('persistent', set())
-            
-            if not has_proc_exec:
-                return f"🔒 **Permission Required: proc_exec**\n\n{danger_reason}\n\nThis command executes code dynamically and may access any file path at runtime. Static analysis cannot detect internal file access.\n\n**Security Note:** Consider using containerized execution for untrusted code."
+        if is_dangerous:
+            dangerous_request = self.permission_gate.check_or_request(
+                session=session,
+                subject=command,
+                required_permissions={"proc_exec"},
+                details={
+                    "proc_exec": (
+                        f"{danger_reason}. This command executes code dynamically and may access "
+                        "any file path at runtime."
+                    )
+                },
+                risk_level="high",
+            )
+            if dangerous_request:
+                return dangerous_request
         
         # 3. 权限分析（常规检查）
         analysis = self.security_analyzer.analyze_shell(command)
         if analysis['permissions']:
-            # 从 session 获取已授予的权限
-            granted = set()
-            if session and hasattr(session, 'granted_permissions'):
-                # 检查持久授权
-                granted.update(session.granted_permissions.get('persistent', set()))
-                # 检查单次授权
-                cmd_hash = self._get_command_hash(command)
-                if cmd_hash in session.granted_permissions.get('one_time', {}):
-                    granted.update(session.granted_permissions['one_time'][cmd_hash])
-                    # 使用后删除单次授权
-                    del session.granted_permissions['one_time'][cmd_hash]
-            
-            # 检查是否有未授权的权限
-            missing_perms = analysis['permissions'] - granted
-            if missing_perms:
-                return {
-                    "type": "permission_request",
-                    "command": command,
-                    "command_hash": self._get_command_hash(command) if session else None,
-                    "risk_level": analysis['risk_level'],
-                    "required_permissions": list(missing_perms),
-                    "details": {perm: analysis['details'].get(perm, '') for perm in missing_perms}
-                }
+            permission_request = self.permission_gate.check_or_request(
+                session=session,
+                subject=command,
+                required_permissions=analysis['permissions'],
+                details=analysis['details'],
+                risk_level=analysis['risk_level'],
+            )
+            if permission_request:
+                return permission_request
         
         # 4. 执行命令
         try:
@@ -322,10 +329,6 @@ class ExecTool(Tool):
         except Exception as e:
             return f"Error executing command: {str(e)}"
 
-    def _get_command_hash(self, command: str) -> str:
-        """生成命令的唯一哈希标识。"""
-        return str(hash(command.strip()))
-    
     def _is_dangerous_command(self, command: str) -> tuple[bool, str | None]:
         """检测命令是否可能包含危险的脚本执行。
         

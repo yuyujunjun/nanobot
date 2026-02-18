@@ -14,6 +14,7 @@ from nanobot.bus.queue import MessageBus
 def _is_permission_request(result: Any) -> bool:
     """检测工具执行结果是否是权限申请。"""
     return isinstance(result, dict) and result.get("type") == "permission_request"
+
 @dataclass
 class PermissionRequest:
     """Represents a pending permission request."""
@@ -21,8 +22,10 @@ class PermissionRequest:
     channel: str
     chat_id: str
     command: str
+    command_hash: str | None
     required_permissions: set[str]
     event: asyncio.Event
+    default_grant_mode: str = "persistent"
     granted: bool = False
     granted_permissions: set[str] = field(default_factory=set)
     mode: str = "persistent"  # or "one-time"
@@ -40,8 +43,10 @@ async def create_permission_request(
     channel: str,
     chat_id: str,
     command: str,
+    command_hash: str | None,
     required_permissions: set[str],
     permission_details: str,
+    default_grant_mode: str = "persistent",
 ) -> str:
     """Create a permission request and notify user.
     
@@ -62,7 +67,9 @@ async def create_permission_request(
         channel=channel,
         chat_id=chat_id,
         command=command,
+        command_hash=command_hash,
         required_permissions=required_permissions,
+        default_grant_mode=default_grant_mode,
         event=event,
     )
     
@@ -70,8 +77,9 @@ async def create_permission_request(
     session.pending_permissions[request_id] = request
     
     # Send permission request to user
+    quick_mode = "one-time" if default_grant_mode == "one-time" else "persistent"
     message_content = permission_details + (
-        f"\n\n**Quick response:** Reply `yes` to grant all permissions (persistent), or `no` to deny.\n"
+        f"\n\n**Quick response:** Reply `yes` to grant all permissions ({quick_mode}), or `no` to deny.\n"
         f"**Request ID:** `{request_id}`\n\n"
         f"**Advanced:** Use `/grant {request_id} <permission> [--mode one-time|persistent]` or `/deny {request_id}`"
     )
@@ -165,7 +173,7 @@ async def AgentLoopCommon(
     """
     # Get model and max_iterations from session
     model = session.config.model if session and session.config.model else provider.get_default_model()
-    max_iterations = session.config.max_iterations if session and session.config.max_iterations else 20
+    max_iterations = session.config.max_iterations if session and session.config.max_iterations else 50
     
     iteration = 0
     final_content = None
@@ -226,6 +234,8 @@ async def AgentLoopCommon(
                     # 从字典中提取权限信息
                     required_permissions = set(result.get("required_permissions", []))
                     command = result.get("command", tool_call.name)
+                    command_hash = result.get("command_hash")
+                    default_grant_mode = result.get("default_grant_mode", "persistent")
                     
                     # 简化权限请求消息
                     risk_emoji = {'none': '✅', 'low': '🟢', 'medium': '🟡', 'high': '🟠', 'critical': '🔴'}
@@ -246,8 +256,10 @@ async def AgentLoopCommon(
                         channel=origin_channel,
                         chat_id=origin_chat_id,
                         command=command,
+                        command_hash=command_hash,
                         required_permissions=required_permissions,
                         permission_details=permission_details,
+                        default_grant_mode=default_grant_mode,
                     )
                     
  
