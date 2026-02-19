@@ -81,6 +81,17 @@ spawn(task: str, label: str = None) -> str
 
 Use for complex or time-consuming tasks that can run independently. The subagent will complete the task and report back when done.
 
+### Usage Principles:
+Task Atomicity: Only spawn a subagent for a discrete, well-defined task. If the task is too broad, the subagent will likely fail or wander off-track.
+
+Context Isolation: Subagents should only receive the information necessary to complete their specific job. This reduces "noise" and prevents data leakage.
+
+Depth Limiting (The "No Inception" Rule): Limit how many levels deep subagents can spawn (e.g., a subagent cannot spawn its own subagent). This prevents infinite loops and spiraling costs.
+
+Ephemeral Nature: Subagents are not long-lived. They should spin up, execute, report back, and terminate immediately.
+
+State Reconciliation: The parent agent is the "source of truth." The subagent proposes changes or results, but the parent agent must validate and integrate them into the main state.
+
 ## Scheduled Reminders (Cron)
 
 Use the `exec` tool to create scheduled reminders with `nanobot cron add`:

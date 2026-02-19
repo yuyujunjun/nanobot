@@ -28,10 +28,13 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        config: Any | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self._config = config
+        self._provider_name = provider_name
         
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -40,27 +43,26 @@ class LiteLLMProvider(LLMProvider):
         
         # Configure environment variables
         if api_key:
-            self._setup_env(api_key, api_base, default_model)
-        
-        if api_base:
-            litellm.api_base = api_base
+            self._setup_env(api_key, api_base, default_model, self._gateway)
         
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
     
-    def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
+    def _setup_env(
+        self,
+        api_key: str,
+        api_base: str | None,
+        model: str,
+        gateway: Any | None = None,
+    ) -> None:
         """Set environment variables based on detected provider."""
-        spec = self._gateway or find_by_model(model)
+        spec = gateway or find_by_model(model)
         if not spec:
             return
 
-        # Gateway/local overrides existing env; standard provider doesn't
-        if self._gateway:
-            os.environ[spec.env_key] = api_key
-        else:
-            os.environ.setdefault(spec.env_key, api_key)
+        os.environ[spec.env_key] = api_key
 
         # Resolve env_extras placeholders:
         #   {api_key}  → user's API key
@@ -69,14 +71,37 @@ class LiteLLMProvider(LLMProvider):
         for env_name, env_val in spec.env_extras:
             resolved = env_val.replace("{api_key}", api_key)
             resolved = resolved.replace("{api_base}", effective_base)
-            os.environ.setdefault(env_name, resolved)
+            os.environ[env_name] = resolved
+
+    def _resolve_runtime_provider(
+        self,
+        model: str,
+    ) -> tuple[str | None, str | None, dict[str, str], str | None, Any | None]:
+        """Resolve provider credentials and gateway by model at call time."""
+        if not self._config:
+            return self.api_key, self.api_base, self.extra_headers, self._provider_name, self._gateway
+
+        provider_cfg = self._config.get_provider(model)
+        provider_name = self._config.get_provider_name(model) or self._provider_name
+        api_key = provider_cfg.api_key if provider_cfg and provider_cfg.api_key else self.api_key
+        api_base = self._config.get_api_base(model)
+        if api_base is None:
+            api_base = self.api_base
+        extra_headers = (
+            provider_cfg.extra_headers
+            if provider_cfg and provider_cfg.extra_headers is not None
+            else self.extra_headers
+        )
+        gateway = find_gateway(provider_name, api_key, api_base)
+        return api_key, api_base, extra_headers or {}, provider_name, gateway
     
-    def _resolve_model(self, model: str) -> str:
+    def _resolve_model(self, model: str, gateway: Any | None = None) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
-        if self._gateway:
+        active_gateway = gateway or self._gateway
+        if active_gateway:
             # Gateway mode: apply gateway prefix, skip provider-specific prefixes
-            prefix = self._gateway.litellm_prefix
-            if self._gateway.strip_model_prefix:
+            prefix = active_gateway.litellm_prefix
+            if active_gateway.strip_model_prefix:
                 model = model.split("/")[-1]
             if prefix and not model.startswith(f"{prefix}/"):
                 model = f"{prefix}/{model}"
@@ -121,7 +146,11 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
-        model = self._resolve_model(model or self.default_model)
+        model = model or self.default_model
+        api_key, api_base, extra_headers, _, gateway = self._resolve_runtime_provider(model)
+        if api_key:
+            self._setup_env(api_key, api_base, model, gateway)
+        model = self._resolve_model(model, gateway)
         
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
@@ -138,16 +167,16 @@ class LiteLLMProvider(LLMProvider):
         self._apply_model_overrides(model, kwargs)
         
         # Pass api_key directly — more reliable than env vars alone
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
+        if api_key:
+            kwargs["api_key"] = api_key
         
         # Pass api_base for custom endpoints
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
+        if api_base:
+            kwargs["api_base"] = api_base
         
         # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
         
         if tools:
             kwargs["tools"] = tools
