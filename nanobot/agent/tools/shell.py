@@ -196,10 +196,15 @@ class ExecTool(Tool):
         timeout: int = 60,
         working_dir: str | None = None,
         restrict_to_workspace: bool = False,
+        workspace_roots: list[str] | None = None,
     ):
         self.timeout = timeout
         self.working_dir = working_dir
         self.restrict_to_workspace = restrict_to_workspace
+        self.workspace_roots = self._resolve_workspace_roots(
+            configured_roots=workspace_roots,
+            working_dir=working_dir,
+        )
         self.security_analyzer = SecurityAnalyzer()
         self.permission_gate = PermissionGate()
     
@@ -358,6 +363,51 @@ class ExecTool(Tool):
         
         return False, None
     
+    def _resolve_workspace_roots(
+        self,
+        *,
+        configured_roots: list[str] | None,
+        working_dir: str | None,
+    ) -> tuple[Path, ...]:
+        """Resolve and deduplicate workspace roots used by static path checks."""
+        candidates: list[Path] = []
+
+        if configured_roots:
+            for root in configured_roots:
+                if root:
+                    candidates.append(Path(root).expanduser())
+        else:
+            if working_dir:
+                candidates.append(Path(working_dir).expanduser())
+            candidates.append(Path.home() / ".nanobot" / "workspace")
+
+        unique_roots: list[Path] = []
+        seen: set[str] = set()
+        for root in candidates:
+            try:
+                resolved = root.resolve()
+            except (ValueError, OSError):
+                continue
+
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_roots.append(resolved)
+
+        return tuple(unique_roots)
+
+    def _is_in_workspace_roots(self, path: Path, cwd_path: Path) -> bool:
+        """Check whether a path is inside any allowed workspace root."""
+        roots = list(self.workspace_roots)
+        if cwd_path not in roots:
+            roots.append(cwd_path)
+
+        for root in roots:
+            if root == path or root in path.parents:
+                return True
+        return False
+
     def _check_workspace_paths(self, command: str, cwd: str) -> str | None:
         """检查命令是否访问工作区外的路径。
         - 无法检测脚本内部的路径访问（如 python script.py 内部行为）
@@ -427,10 +477,10 @@ class ExecTool(Tool):
             
             try:
                 resolved = Path(clean_path).resolve()
-                if cwd_path not in resolved.parents and resolved != cwd_path:
+                if not self._is_in_workspace_roots(resolved, cwd_path):
                     # 可能在工作区外，但给出警告而不是直接阻止
                     # 因为可能是误判（搜索文本等）
-                    return f"Warning: Path '{clean_path}' may be outside workspace. If this is text/search content, request 'file_write' permission to override."
+                    return f"Warning: Path '{clean_path}' may be outside workspace. If this is text/search content, request 'path_outside_workspace' permission to override."
             except (ValueError, OSError):
                 continue
         

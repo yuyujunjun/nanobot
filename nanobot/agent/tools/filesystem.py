@@ -26,6 +26,12 @@ def _is_outside_allowed_dir(path: str, allowed_dir: Path | None) -> bool:
     return not str(resolved).startswith(str(allowed_dir.resolve()))
 
 
+def _should_request_permission(path: str, allowed_dir: Path | None) -> bool:
+    if allowed_dir is None:
+        return True
+    return _is_outside_allowed_dir(path, allowed_dir)
+
+
 class ReadFileTool(Tool):
     """Tool to read file contents."""
     
@@ -57,25 +63,26 @@ class ReadFileTool(Tool):
     async def execute(self, path: str, session=None, **kwargs: Any) -> str:
         try:
             outside_allowed_dir = _is_outside_allowed_dir(path, self._allowed_dir)
-            permission_request = self._permission_gate.check_or_request(
-                session=session,
-                subject=f"read_file:{path}",
-                required_permissions=(
-                    {"file_read", "path_outside_allowed_dir"}
-                    if outside_allowed_dir
-                    else {"file_read"}
-                ),
-                details={
-                    "file_read": "Read file content from filesystem",
-                    "path_outside_allowed_dir": (
-                        "Path is outside configured allowed_dir, requires explicit override"
+            if _should_request_permission(path, self._allowed_dir):
+                permission_request = self._permission_gate.check_or_request(
+                    session=session,
+                    subject=f"read_file:{path}",
+                    required_permissions=(
+                        {"file_read", "path_outside_allowed_dir"}
+                        if outside_allowed_dir
+                        else {"file_read"}
                     ),
-                },
-                risk_level="low",
-                default_grant_mode="one-time" if outside_allowed_dir else "persistent",
-            )
-            if permission_request:
-                return permission_request
+                    details={
+                        "file_read": "Read file content from filesystem",
+                        "path_outside_allowed_dir": (
+                            "Path is outside configured allowed_dir, requires explicit override"
+                        ),
+                    },
+                    risk_level="low",
+                    default_grant_mode="one-time" if outside_allowed_dir else "persistent",
+                )
+                if permission_request:
+                    return permission_request
 
             file_path = _resolve_path(
                 path,
@@ -130,25 +137,26 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, session=None, **kwargs: Any) -> str:
         try:
             outside_allowed_dir = _is_outside_allowed_dir(path, self._allowed_dir)
-            permission_request = self._permission_gate.check_or_request(
-                session=session,
-                subject=f"write_file:{path}",
-                required_permissions=(
-                    {"file_write", "path_outside_allowed_dir"}
-                    if outside_allowed_dir
-                    else {"file_write"}
-                ),
-                details={
-                    "file_write": "Write file content to filesystem",
-                    "path_outside_allowed_dir": (
-                        "Path is outside configured allowed_dir, requires explicit override"
+            if _should_request_permission(path, self._allowed_dir):
+                permission_request = self._permission_gate.check_or_request(
+                    session=session,
+                    subject=f"write_file:{path}",
+                    required_permissions=(
+                        {"file_write", "path_outside_allowed_dir"}
+                        if outside_allowed_dir
+                        else {"file_write"}
                     ),
-                },
-                risk_level="medium",
-                default_grant_mode="one-time" if outside_allowed_dir else "persistent",
-            )
-            if permission_request:
-                return permission_request
+                    details={
+                        "file_write": "Write file content to filesystem",
+                        "path_outside_allowed_dir": (
+                            "Path is outside configured allowed_dir, requires explicit override"
+                        ),
+                    },
+                    risk_level="medium",
+                    default_grant_mode="one-time" if outside_allowed_dir else "persistent",
+                )
+                if permission_request:
+                    return permission_request
 
             file_path = _resolve_path(
                 path,
@@ -203,25 +211,26 @@ class EditFileTool(Tool):
     async def execute(self, path: str, old_text: str, new_text: str, session=None, **kwargs: Any) -> str:
         try:
             outside_allowed_dir = _is_outside_allowed_dir(path, self._allowed_dir)
-            permission_request = self._permission_gate.check_or_request(
-                session=session,
-                subject=f"edit_file:{path}",
-                required_permissions=(
-                    {"file_write", "path_outside_allowed_dir"}
-                    if outside_allowed_dir
-                    else {"file_write"}
-                ),
-                details={
-                    "file_write": "Modify file content on filesystem",
-                    "path_outside_allowed_dir": (
-                        "Path is outside configured allowed_dir, requires explicit override"
+            if _should_request_permission(path, self._allowed_dir):
+                permission_request = self._permission_gate.check_or_request(
+                    session=session,
+                    subject=f"edit_file:{path}",
+                    required_permissions=(
+                        {"file_write", "path_outside_allowed_dir"}
+                        if outside_allowed_dir
+                        else {"file_write"}
                     ),
-                },
-                risk_level="medium",
-                default_grant_mode="one-time" if outside_allowed_dir else "persistent",
-            )
-            if permission_request:
-                return permission_request
+                    details={
+                        "file_write": "Modify file content on filesystem",
+                        "path_outside_allowed_dir": (
+                            "Path is outside configured allowed_dir, requires explicit override"
+                        ),
+                    },
+                    risk_level="medium",
+                    default_grant_mode="one-time" if outside_allowed_dir else "persistent",
+                )
+                if permission_request:
+                    return permission_request
 
             file_path = _resolve_path(
                 path,
@@ -282,25 +291,26 @@ class ListDirTool(Tool):
     async def execute(self, path: str, session=None, **kwargs: Any) -> str:
         try:
             outside_allowed_dir = _is_outside_allowed_dir(path, self._allowed_dir)
-            permission_request = self._permission_gate.check_or_request(
-                session=session,
-                subject=f"list_dir:{path}",
-                required_permissions=(
-                    {"file_read", "path_outside_allowed_dir"}
-                    if outside_allowed_dir
-                    else {"file_read"}
-                ),
-                details={
-                    "file_read": "List directory entries from filesystem",
-                    "path_outside_allowed_dir": (
-                        "Path is outside configured allowed_dir, requires explicit override"
+            if _should_request_permission(path, self._allowed_dir):
+                permission_request = self._permission_gate.check_or_request(
+                    session=session,
+                    subject=f"list_dir:{path}",
+                    required_permissions=(
+                        {"file_read", "path_outside_allowed_dir"}
+                        if outside_allowed_dir
+                        else {"file_read"}
                     ),
-                },
-                risk_level="low",
-                default_grant_mode="one-time" if outside_allowed_dir else "persistent",
-            )
-            if permission_request:
-                return permission_request
+                    details={
+                        "file_read": "List directory entries from filesystem",
+                        "path_outside_allowed_dir": (
+                            "Path is outside configured allowed_dir, requires explicit override"
+                        ),
+                    },
+                    risk_level="low",
+                    default_grant_mode="one-time" if outside_allowed_dir else "persistent",
+                )
+                if permission_request:
+                    return permission_request
 
             dir_path = _resolve_path(
                 path,

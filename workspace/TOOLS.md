@@ -44,19 +44,8 @@ exec(command: str, working_dir: str = None) -> str
 
 ## Web Access
 
-### web_search
-Search the web using Brave Search API.
-```
-web_search(query: str, count: int = 5) -> str
-```
+Use google-ai-mode-skill
 
-Returns search results with titles, URLs, and snippets. Requires `tools.web.search.apiKey` in config.
-
-### web_fetch
-Fetch and extract main content from a URL.
-```
-web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
-```
 
 **Notes:**
 - Content is extracted using readability
