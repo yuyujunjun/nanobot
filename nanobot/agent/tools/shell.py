@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -398,13 +399,18 @@ class ExecTool(Tool):
         return tuple(unique_roots)
 
     def _is_in_workspace_roots(self, path: Path, cwd_path: Path) -> bool:
-        """Check whether a path is inside any allowed workspace root."""
+        """Check whether a path is inside any allowed workspace root (root==path or root in path.parents)."""
         roots = list(self.workspace_roots)
         if cwd_path not in roots:
             roots.append(cwd_path)
 
         for root in roots:
-            if root == path or root in path.parents:
+            try:
+                root_resolved = root.resolve()
+                path_resolved = path.resolve()
+            except Exception:
+                continue
+            if path_resolved == root_resolved or root_resolved in path_resolved.parents:
                 return True
         return False
 
@@ -453,30 +459,46 @@ class ExecTool(Tool):
         # 移除单引号字符串
         cmd_clean = re.sub(r"'[^']*'", '__STRING__', cmd_clean)
         
-        # 提取疑似路径（更保守的策略）
+        # 用 shlex 拆分命令，提取所有参数
         potential_paths = []
-        
-        # Windows绝对路径
-        potential_paths.extend(re.findall(r'[A-Za-z]:[\\\/][^\s\'"<>|]+', cmd_clean))
-        
-        # POSIX绝对路径（排除选项）
-        posix_matches = re.findall(r'(?<![=:])(/[a-zA-Z0-9_\-./]+)', cmd_clean)
-        
-        for match in posix_matches:
-            # 过滤误判
-            if (match.startswith('//') or match == '__URL__' or match == '__STRING__' or
-                any(match.startswith(allowed) for allowed in ALLOWED_SYSTEM_PATHS) or
-                match in ['/', '/dev', '/tmp', '/proc', '/sys'] or
-                len(match) < 3):  # 太短
+        try:
+            args = shlex.split(cmd)
+        except Exception:
+            args = cmd.split()
+
+        for arg in args:
+            # 跳过选项参数
+            if arg.startswith('-') or arg in ['|', '>', '>>', '<', '&&', '||']:
                 continue
-            potential_paths.append(match)
+            # 跳过 URL、字符串占位符
+            if arg in ['__URL__', '__STRING__']:
+                continue
+            # 跳过太短的
+            if len(arg) < 3:
+                continue
+            # 跳过常见设备和系统路径
+            if any(arg.startswith(allowed) for allowed in ALLOWED_SYSTEM_PATHS):
+                continue
+            # 跳过纯文件名
+            if '/' not in arg and '\\' not in arg:
+                continue
+            potential_paths.append(arg)
         
         # 检查路径是否在工作区外
         for raw_path in potential_paths:
             clean_path = raw_path.rstrip('.,;:)')
-            
             try:
-                resolved = Path(clean_path).resolve()
+                # 先用 cwd_path 作为基准 resolve（支持相对路径）
+                candidate = Path(clean_path)
+                # DEBUG
+                import sys
+                print(f"[DEBUG] clean_path={clean_path} candidate={candidate} is_absolute={candidate.is_absolute()} cwd_path={cwd_path}", file=sys.stderr)
+                # 只要不是绝对路径，都用 cwd_path 拼接
+                if not candidate.is_absolute():
+                    resolved = (cwd_path / candidate).resolve()
+                else:
+                    resolved = candidate.resolve()
+                print(f"[DEBUG] resolved={resolved}", file=sys.stderr)
                 if not self._is_in_workspace_roots(resolved, cwd_path):
                     # 可能在工作区外，但给出警告而不是直接阻止
                     # 因为可能是误判（搜索文本等）
