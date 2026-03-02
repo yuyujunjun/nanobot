@@ -373,28 +373,87 @@ class ExecTool(Tool):
         """Resolve and deduplicate workspace roots used by static path checks."""
         candidates: list[Path] = []
 
+        # 1) If user explicitly configured roots, use those (expand envs and ~)
         if configured_roots:
             for root in configured_roots:
                 if root:
-                    candidates.append(Path(root).expanduser())
+                    candidates.append(Path(os.path.expandvars(root)).expanduser())
         else:
-            if working_dir:
-                candidates.append(Path(working_dir).expanduser())
+            # (已移除) 不再隐式从环境变量读取工作区路径，保留显式配置和向上查找逻辑
+
+            # 3) Common default locations
+            candidates.append(Path.home() / ".openclaw" / "workspace")
             candidates.append(Path.home() / ".nanobot" / "workspace")
 
+            # 4) If a working_dir was provided, try to detect a workspace root by
+            #    walking upward and looking for common markers ('.openclaw', '.nanobot', 'workspace', '.git')
+            if working_dir:
+                try:
+                    wd = Path(os.path.expandvars(working_dir)).expanduser().resolve()
+                except Exception:
+                    wd = Path(os.path.expandvars(working_dir)).expanduser()
+
+                candidates.append(wd)
+
+                for parent in (wd, *wd.parents):
+                    name = parent.name.lower()
+                    # If the parent looks like a known workspace container, prefer the expected workspace path
+                    if name in (".openclaw", ".nanobot"):
+                        workspace_dir = parent / "workspace"
+                        candidates.append(parent)
+                        candidates.append(workspace_dir)
+                    # If directory name itself is 'workspace' include it
+                    if name == "workspace":
+                        candidates.append(parent)
+                    # If this parent contains a 'workspace' child, prefer that child
+                    try:
+                        if (parent / "workspace").exists():
+                            candidates.append(parent / "workspace")
+                    except Exception:
+                        pass
+                    # also accept .git as possible repo root marker
+                    try:
+                        if (parent / ".git").exists():
+                            candidates.append(parent)
+                    except Exception:
+                        pass
+
+        # Deduplicate and resolve
         unique_roots: list[Path] = []
         seen: set[str] = set()
         for root in candidates:
+            if not root:
+                continue
             try:
                 resolved = root.resolve()
             except (ValueError, OSError):
-                continue
+                # fallback to expanded but unresolved Path
+                try:
+                    resolved = Path(str(root))
+                except Exception:
+                    continue
 
             key = str(resolved)
             if key in seen:
                 continue
+            # Only include paths that actually exist to improve robustness
+            if not resolved.exists():
+                # allow non-existing ones if they look like reasonable home-based defaults
+                if not (str(resolved).startswith(str(Path.home()))):
+                    continue
             seen.add(key)
             unique_roots.append(resolved)
+
+        # If nothing found, fall back to working_dir (resolved if possible)
+        if not unique_roots:
+            if working_dir:
+                try:
+                    fallback = Path(os.path.expandvars(working_dir)).expanduser().resolve()
+                except Exception:
+                    fallback = Path(os.path.expandvars(working_dir)).expanduser()
+                unique_roots.append(fallback)
+            else:
+                unique_roots.append(Path.home() / ".nanobot" / "workspace")
 
         return tuple(unique_roots)
 
@@ -404,11 +463,17 @@ class ExecTool(Tool):
         if cwd_path not in roots:
             roots.append(cwd_path)
 
+        # Debug log for workspace roots and paths
+        print(f"[DEBUG] Workspace roots: {roots}")
+        print(f"[DEBUG] Checking path: {path}")
+
         for root in roots:
             try:
                 root_resolved = root.resolve()
                 path_resolved = path.resolve()
-            except Exception:
+                print(f"[DEBUG] Comparing resolved root: {root_resolved} with path: {path_resolved}")
+            except Exception as e:
+                print(f"[DEBUG] Error resolving paths: {e}")
                 continue
             if path_resolved == root_resolved or root_resolved in path_resolved.parents:
                 return True
